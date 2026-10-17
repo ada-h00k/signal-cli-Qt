@@ -1,0 +1,692 @@
+name: Build Linux Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - test-windows-build
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_TYPE: Release
+  QT_VERSION: "6.12"
+
+jobs:
+  build:
+    name: Build Linux x86_64
+    runs-on: ubuntu-24.04
+
+    steps:
+      # --------------------------------------------------
+      # Checkout
+      # --------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # System dependencies
+      # --------------------------------------------------
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            file \
+            curl \
+            wget \
+            ca-certificates \
+            fuse3 \
+            libfuse2t64 \
+            libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1 \
+            libxcb-util1 \
+            libx11-xcb1 \
+            libdbus-1-3 \
+            libfontconfig1 \
+            libfreetype6 \
+            libegl1 \
+            libopengl0 \
+            libqrencode-dev \
+            qtkeychain-qt6-dev
+
+      # --------------------------------------------------
+      # Qt
+      # --------------------------------------------------
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtmultimedia
+          cache: true
+
+      - name: Configure Qt environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "QT_ROOT_DIR=$QT_ROOT_DIR"
+
+          QMAKE_PATH="$(find "$QT_ROOT_DIR" \
+            -type f -name qmake -print -quit)"
+
+          if [ -z "$QMAKE_PATH" ]; then
+            echo "::error::qmake not found in $QT_ROOT_DIR"
+            exit 1
+          fi
+
+          echo "QMAKE=$QMAKE_PATH" >> "$GITHUB_ENV"
+          "$QMAKE_PATH" --version
+
+      # --------------------------------------------------
+      # Rust
+      # --------------------------------------------------
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo test \
+            --release \
+            --locked \
+            --manifest-path history-store/Cargo.toml
+
+      # --------------------------------------------------
+      # CMake
+      # --------------------------------------------------
+      - name: Configure CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake \
+            -S . \
+            -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # --------------------------------------------------
+      # Locate application executable
+      # --------------------------------------------------
+      - name: Locate executable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find build -maxdepth 4 -type f -executable -print
+
+          BINARY=""
+
+          for candidate in \
+            build/signal-cli-qt \
+            build/bin/signal-cli-qt \
+            build/signal-cli-Qt \
+            build/bin/signal-cli-Qt
+          do
+            if [ -f "$candidate" ]; then
+              BINARY="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$BINARY" ]; then
+            echo "::error::Application binary not found. Check the CMake target name."
+            exit 1
+          fi
+
+          echo "BINARY=$BINARY" >> "$GITHUB_ENV"
+          file "$BINARY"
+
+      # --------------------------------------------------
+      # Plain Linux binary
+      # --------------------------------------------------
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          cp "$BINARY" dist/signal-cli-qt-linux-x86_64
+          chmod +x dist/signal-cli-qt-linux-x86_64
+
+          mkdir -p "$RUNNER_TEMP/signal-cli-qt-installer"
+          cp dist/signal-cli-qt-linux-x86_64 "$RUNNER_TEMP/signal-cli-qt-installer/"
+          cp packaging/install.sh packaging/signal-cli-qt.desktop packaging/signal-cli-qt.svg \
+            "$RUNNER_TEMP/signal-cli-qt-installer/"
+          chmod +x "$RUNNER_TEMP/signal-cli-qt-installer/install.sh"
+          tar -czf "$GITHUB_WORKSPACE/dist/signal-cli-qt-linux-x86_64-installer.tar.gz" \
+            -C "$RUNNER_TEMP/signal-cli-qt-installer" .
+
+      # --------------------------------------------------
+      # Validate output and checksums
+      # --------------------------------------------------
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s dist/signal-cli-qt-linux-x86_64
+          test -s dist/signal-cli-qt-linux-x86_64-installer.tar.gz
+
+          tar -tzf dist/signal-cli-qt-linux-x86_64-installer.tar.gz
+
+          file dist/signal-cli-qt-linux-x86_64
+
+          (
+            cd dist
+            sha256sum \
+              signal-cli-qt-linux-x86_64 \
+              signal-cli-qt-linux-x86_64-installer.tar.gz \
+              > SHA256SUMS
+          )
+
+          cat dist/SHA256SUMS
+          ls -lh dist
+
+      # --------------------------------------------------
+      # Preserve artifacts even when a later step fails
+      # --------------------------------------------------
+      - name: Upload build artifacts
+        if: always() && hashFiles('dist/*') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-cli-qt-linux-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  # ------------------------------------------------------
+  # Arch Linux package (built natively in an Arch container)
+  # ------------------------------------------------------
+  arch-package:
+    name: Build Arch Linux package
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      # git must exist before checkout so that the full history is cloned
+      - name: Install git
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pacman -Syu --noconfirm --needed git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare source tarball and PKGBUILD
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          base="$(sed -n 's/^project(signal-cli-qt VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          count="$(git rev-list --count HEAD)"
+          short="$(git rev-parse --short=7 HEAD)"
+          pkgver="${base}.r${count}.g${short}"
+          echo "PKGVER=$pkgver" >> "$GITHUB_ENV"
+
+          # makepkg refuses to run as root
+          useradd --create-home builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+
+          build_dir=/home/builder/pkg
+          mkdir -p "$build_dir"
+
+          git archive --format=tar.gz \
+            --prefix="signal-cli-qt-${pkgver}/" \
+            -o "$build_dir/signal-cli-qt-${pkgver}.tar.gz" HEAD
+          cp packaging/arch/PKGBUILD "$build_dir/PKGBUILD"
+          sed -i "s/^pkgver=.*/pkgver=${pkgver}/" "$build_dir/PKGBUILD"
+
+          chown -R builder:builder /home/builder
+          cat "$build_dir/PKGBUILD"
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          su builder -c 'cd ~/pkg && makepkg --syncdeps --noconfirm --nocolor'
+
+      - name: Inspect package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp /home/builder/pkg/*.pkg.tar.zst dist/
+
+          for pkg in dist/*.pkg.tar.zst; do
+            pacman -Qip "$pkg"
+            pacman -Qlp "$pkg"
+          done
+
+          # the package must contain the executable, desktop entry, icon and license
+          files="$(pacman -Qlp dist/*.pkg.tar.zst)"
+          for path in \
+            /usr/bin/signal-cli-qt \
+            /usr/share/applications/signal-cli-qt.desktop \
+            /usr/share/icons/hicolor/scalable/apps/signal-cli-qt.svg \
+            /usr/share/licenses/signal-cli-qt/LICENSE
+          do
+            if ! grep -qxF "signal-cli-qt $path" <<< "$files"; then
+              echo "::error::Package is missing $path"
+              exit 1
+            fi
+          done
+
+      - name: Upload Arch package artifact
+        if: always() && hashFiles('dist/*') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-cli-qt-arch-${{ github.sha }}
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------
+  # macOS app (Swift / SwiftUI, Apple silicon)
+  # ------------------------------------------------------
+  macos-app:
+    name: Build macOS app (arm64)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Builds the Rust history store, the Swift package and the .app bundle
+      - name: Build app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          macos/scripts/build-app.sh
+
+      - name: Run Swift tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path macos
+
+      - name: Package app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          ditto -c -k --keepParent "macos/build/signal-cli Mac.app" dist/signal-cli-mac-macos-arm64.zip
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s dist/signal-cli-mac-macos-arm64.zip
+          unzip -l dist/signal-cli-mac-macos-arm64.zip
+          codesign --verify --verbose "macos/build/signal-cli Mac.app"
+          file "macos/build/signal-cli Mac.app/Contents/MacOS/signal-cli-mac"
+          ls -lh dist
+
+      - name: Upload build artifacts
+        if: always() && hashFiles('dist/*') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-cli-qt-macos-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------
+  # Windows app + installer (x86_64)
+  # ------------------------------------------------------
+  windows-app:
+    name: Build Windows app (x64)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtmultimedia
+          cache: true
+
+      # libqrencode is provided by vcpkg. pkg-config is installed because the
+      # project's Linux build already consumes pkg-config metadata for this library.
+      - name: Install Windows dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & "$vcpkgRoot\vcpkg.exe" install libqrencode:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          choco install pkgconfiglite --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $pkgConfig = Get-Command 'pkg-config.exe' -ErrorAction SilentlyContinue
+          if (-not $pkgConfig) {
+            $pkgConfig = Get-Command 'pkg-config' -ErrorAction SilentlyContinue
+          }
+          if (-not $pkgConfig) {
+            throw 'pkg-config was not found after installing pkgconfiglite.'
+          }
+
+          $vcpkgInstalled = Join-Path $vcpkgRoot 'installed\x64-windows'
+          $pcDir = Join-Path $vcpkgInstalled 'lib\pkgconfig'
+          New-Item -ItemType Directory -Force -Path $pcDir | Out-Null
+
+          $prefix = $vcpkgInstalled.Replace('\', '/')
+          $pcContent = @'
+          prefix=__VCPKG_PREFIX__
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: libqrencode
+          Description: QR Code encoding library
+          Version: 4.1.1
+          Libs: -L${libdir} -lqrencode
+          Cflags: -I${includedir}
+          '@
+          $pcContent = $pcContent.Replace('__VCPKG_PREFIX__', $prefix)
+          Set-Content -Path (Join-Path $pcDir 'libqrencode.pc') -Value $pcContent -Encoding ascii
+
+          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$pcDir" >> $env:GITHUB_ENV
+          "PKG_CONFIG_EXE=$($pkgConfig.Source)" >> $env:GITHUB_ENV
+
+      # Build QtKeychain against the same Qt installation as the application.
+      - name: Checkout QtKeychain
+        uses: actions/checkout@v4
+        with:
+          repository: frankosterfeld/qtkeychain
+          ref: 0.14.3
+          path: qtkeychain-src
+
+      - name: Build QtKeychain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          cmake -S qtkeychain-src -B qtkeychain-build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DBUILD_WITH_QT6=ON `
+            -DBUILD_TEST_APPLICATION=OFF `
+            -DBUILD_TRANSLATIONS=OFF `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\windows-deps"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake --build qtkeychain-build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake --install qtkeychain-build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run Rust tests
+        shell: pwsh
+        run: cargo test --release --locked --manifest-path history-store/Cargo.toml
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $prefixPath = "$env:QT_ROOT_DIR;$env:GITHUB_WORKSPACE\windows-deps;$env:VCPKG_ROOT\installed\x64-windows"
+          cmake `
+            -S . `
+            -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$prefixPath" `
+            -DPKG_CONFIG_EXECUTABLE="$env:PKG_CONFIG_EXE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Package application and create Setup installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $binary = Get-ChildItem -Path build -Recurse -File |
+            Where-Object { $_.Name -in @('signal-cli-qt.exe', 'signal-cli-Qt.exe') } |
+            Select-Object -First 1
+
+          if (-not $binary) {
+            throw 'Application EXE not found. Check the CMake target name and Windows build output.'
+          }
+
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist\signal-cli-qt-windows-x86_64'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $targetExe = Join-Path $stage 'signal-cli-qt.exe'
+          Copy-Item $binary.FullName $targetExe -Force
+
+          # Copy Qt runtime DLLs and plugins required by the executable.
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --compiler-runtime $targetExe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Include the separately built QtKeychain DLL and vcpkg runtime DLLs.
+          Get-ChildItem -Path "$env:GITHUB_WORKSPACE\windows-deps" -Recurse -Filter '*.dll' -File |
+            Copy-Item -Destination $stage -Force
+          Get-ChildItem -Path "$env:VCPKG_ROOT\installed\x64-windows\bin" -Filter '*.dll' -File |
+            Copy-Item -Destination $stage -Force
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "$stage\*" `
+            -DestinationPath 'dist\signal-cli-qt-windows-x86_64.zip' `
+            -CompressionLevel Optimal -Force
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $programFilesX86 = [System.Environment]::GetFolderPath('ProgramFilesX86')
+          $iscc = Join-Path $programFilesX86 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            $iscc = Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'
+          }
+          if (-not (Test-Path $iscc)) {
+            throw 'Inno Setup compiler (ISCC.exe) was not found.'
+          }
+
+          $cmakeText = Get-Content 'CMakeLists.txt' -Raw
+          $versionMatch = [regex]::Match($cmakeText, 'project\(\s*signal-cli-qt\s+VERSION\s+([0-9]+(?:\.[0-9]+)*)')
+          $appVersion = if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { '1.0.0' }
+
+          $iss = @"
+          #define MyAppName "signal-cli-qt"
+          #define MyAppVersion "$appVersion"
+          #define SourceDir "dist\signal-cli-qt-windows-x86_64"
+
+          [Setup]
+          AppId={{9D53C2A8-4D8A-47B0-9A84-6E2D793F43A1}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          DefaultDirName={localappdata}\Programs\signal-cli-qt
+          DefaultGroupName=signal-cli-qt
+          UninstallDisplayIcon={app}\signal-cli-qt.exe
+          PrivilegesRequired=lowest
+          ArchitecturesAllowed=x64
+          ArchitecturesInstallIn64BitMode=x64
+          OutputDir=dist
+          OutputBaseFilename=signal-cli-qt-windows-x86_64-setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+
+          [Files]
+          Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{group}\signal-cli-qt"; Filename: "{app}\signal-cli-qt.exe"
+          Name: "{autodesktop}\signal-cli-qt"; Filename: "{app}\signal-cli-qt.exe"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\signal-cli-qt.exe"; Description: "Launch signal-cli-qt"; Flags: postinstall nowait skipifsilent
+          "@
+          Set-Content -Path 'windows-installer.iss' -Value $iss -Encoding ascii
+
+          & $iscc 'windows-installer.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Windows artifacts
+        shell: pwsh
+        run: |
+          $setup = 'dist\signal-cli-qt-windows-x86_64-setup.exe'
+          $zip = 'dist\signal-cli-qt-windows-x86_64.zip'
+          if (-not (Test-Path $setup) -or (Get-Item $setup).Length -eq 0) {
+            throw "Windows Setup was not created: $setup"
+          }
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+            throw "Portable Windows ZIP was not created: $zip"
+          }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload Windows artifacts
+        if: always() && hashFiles('dist/*') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-cli-qt-windows-${{ github.sha }}
+          path: |
+            dist/signal-cli-qt-windows-x86_64-setup.exe
+            dist/signal-cli-qt-windows-x86_64.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------
+  # Create a release for every commit (all artifacts together)
+  # ------------------------------------------------------
+  release:
+    # Only publish releases from the main branches. Test branches still build and upload artifacts.
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+      - arch-package
+      - macos-app
+      - windows-app
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signal-cli-qt-*-${{ github.sha }}
+          path: dist
+          merge-multiple: true
+
+      - name: Regenerate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd dist
+          rm -f SHA256SUMS
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs -r sha256sum > SHA256SUMS
+
+          cat SHA256SUMS
+          ls -lh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.sha }}
+          name: Build ${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Automatic Linux x86_64, Windows x86_64, and macOS (Apple silicon) build.
+
+            Commit: `${{ github.sha }}`
+
+            Files:
+            - `signal-cli-qt-linux-x86_64` — plain executable
+            - `signal-cli-qt-linux-x86_64-installer.tar.gz` — executable, per-user installer, and menu resources
+            - `signal-cli-qt-<version>-1-x86_64.pkg.tar.zst` — Arch Linux package (`sudo pacman -U <file>`)
+            - `signal-cli-qt-windows-x86_64-setup.exe` — Windows x64 setup installer
+            - `signal-cli-qt-windows-x86_64.zip` — portable Windows x64 application bundle
+            - `signal-cli-mac-macos-arm64.zip` — native macOS app for Apple silicon, macOS 14 or newer
+              (ad-hoc signed: open it the first time with right-click → Open)
+            - `SHA256SUMS` — SHA-256 checksums for all release files
+
+            `signal-cli` must be installed separately (on Arch e.g. from the AUR, on macOS `brew install signal-cli`).
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/signal-cli-qt-linux-x86_64
+            dist/signal-cli-qt-linux-x86_64-installer.tar.gz
+            dist/*.pkg.tar.zst
+            dist/signal-cli-qt-windows-x86_64-setup.exe
+            dist/signal-cli-qt-windows-x86_64.zip
+            dist/signal-cli-mac-macos-arm64.zip
+            dist/SHA256SUMS
